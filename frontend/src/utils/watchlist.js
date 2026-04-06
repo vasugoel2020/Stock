@@ -1,35 +1,57 @@
-// Watchlist utility functions using localStorage
+/**
+ * Watchlist utility functions using localStorage
+ * Note: For production, consider moving to backend storage with authentication
+ * or implementing encryption for sensitive data
+ */
 
 const WATCHLIST_KEY = 'stock_watchlist';
+
+// Simple validation to prevent XSS
+const sanitizeString = (str) => {
+  if (typeof str !== 'string') return '';
+  return str.replace(/<script[^>]*>.*?<\/script>/gi, '').trim();
+};
 
 export const getWatchlist = () => {
   try {
     const data = localStorage.getItem(WATCHLIST_KEY);
-    return data ? JSON.parse(data) : [];
+    if (!data) return [];
+    
+    const parsed = JSON.parse(data);
+    // Validate structure
+    if (!Array.isArray(parsed)) return [];
+    
+    return parsed.map(item => ({
+      ticker: sanitizeString(item.ticker),
+      company: sanitizeString(item.company),
+      currentPrice: typeof item.currentPrice === 'number' ? item.currentPrice : null,
+      addedAt: item.addedAt || new Date().toISOString()
+    }));
   } catch (error) {
-    console.error('Error reading watchlist:', error);
     return [];
   }
 };
 
 export const addToWatchlist = (stock) => {
   try {
+    if (!stock || !stock.ticker) return false;
+    
     const watchlist = getWatchlist();
     const exists = watchlist.find(item => item.ticker === stock.ticker);
     
     if (!exists) {
-      const newWatchlist = [...watchlist, {
-        ticker: stock.ticker,
-        company: stock.company,
+      const newItem = {
+        ticker: sanitizeString(stock.ticker),
+        company: sanitizeString(stock.company),
         currentPrice: stock.currentPrice,
         addedAt: new Date().toISOString()
-      }];
+      };
+      const newWatchlist = [...watchlist, newItem];
       localStorage.setItem(WATCHLIST_KEY, JSON.stringify(newWatchlist));
       return true;
     }
     return false;
   } catch (error) {
-    console.error('Error adding to watchlist:', error);
     return false;
   }
 };
@@ -41,7 +63,6 @@ export const removeFromWatchlist = (ticker) => {
     localStorage.setItem(WATCHLIST_KEY, JSON.stringify(newWatchlist));
     return true;
   } catch (error) {
-    console.error('Error removing from watchlist:', error);
     return false;
   }
 };

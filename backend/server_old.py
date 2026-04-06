@@ -6,7 +6,7 @@ import time
 import uuid
 from datetime import datetime
 from statistics import mean
-from typing import Any, Optional, Tuple, List, Dict
+from typing import Any
 
 import yfinance as yf
 from fastapi import FastAPI, Request
@@ -40,7 +40,6 @@ app.add_middleware(
 )
 
 
-# ============ Cache Management ============
 def cache_get(key: str) -> dict[str, Any] | None:
     item = _RESPONSE_CACHE.get(key)
     if not item:
@@ -57,17 +56,15 @@ def cache_set(key: str, value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-# ============ Utility Functions ============
 def normalize_space(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
 def safe_float(value: Any) -> float | None:
-    """Safely convert value to float, handling NaN and invalid values"""
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        if value != value:  # NaN check
+        if value != value:
             return None
         return float(value)
     text = str(value).strip().replace(",", "")
@@ -75,7 +72,7 @@ def safe_float(value: Any) -> float | None:
         return None
     try:
         number = float(text)
-        if number != number:  # NaN check
+        if number != number:
             return None
         return number
     except ValueError:
@@ -87,14 +84,12 @@ def round_or_none(value: float | None, digits: int = 2) -> float | None:
 
 
 def percent_change(current: float | None, previous: float | None) -> float | None:
-    """Calculate percentage change between two values"""
-    if current is None or previous is None or previous == 0:
+    if current is None or previous in (None, 0):
         return None
     return round(((current - previous) / abs(previous)) * 100, 2)
 
 
 def compact_currency(value: float | None, currency: str | None) -> str:
-    """Format currency in compact form (B, T, etc.)"""
     if value is None:
         return "N/A"
     code = (currency or "INR").upper()
@@ -110,7 +105,6 @@ def compact_currency(value: float | None, currency: str | None) -> str:
 
 
 def format_date(value: Any) -> str | None:
-    """Format various date formats to standard string"""
     if value is None:
         return None
     if hasattr(value, "to_pydatetime"):
@@ -131,21 +125,14 @@ def format_date(value: Any) -> str | None:
     return text
 
 
-# ============ Query Extraction ============
-def _extract_from_direct_fields(payload: dict[str, Any]) -> Optional[str]:
-    """Extract stock query from direct payload fields"""
+def extract_query(payload: dict[str, Any]) -> str:
     for key in ("stock", "ticker", "symbol", "query"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return None
 
-
-def _extract_from_messages(payload: dict[str, Any]) -> Optional[str]:
-    """Extract stock query from messages array"""
     messages = payload.get("messages") or []
     texts: list[str] = []
-    
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
@@ -156,36 +143,19 @@ def _extract_from_messages(payload: dict[str, Any]) -> Optional[str]:
             for block in content:
                 if isinstance(block, dict) and isinstance(block.get("text"), str):
                     texts.append(block["text"])
-    
-    if not texts:
-        return None
-    
-    combined = normalize_space(texts[-1])
+
+    combined = normalize_space(texts[-1] if texts else "")
     quoted = re.findall(r'"([^"]+)"', combined)
     if quoted:
         return quoted[-1].strip()
-    
-    # Clean up common patterns
+
     combined = re.sub(r"(?i)^analyze this indian stock comprehensively:\s*", "", combined)
     combined = re.sub(r"(?i)return only json\.?", "", combined)
     combined = re.sub(r"(?i)^analyze\s+", "", combined)
     return combined.strip(" .")
 
 
-def extract_query(payload: dict[str, Any]) -> str:
-    """Extract stock query from request payload"""
-    # Try direct fields first
-    query = _extract_from_direct_fields(payload)
-    if query:
-        return query
-    
-    # Try messages array
-    query = _extract_from_messages(payload)
-    return query or ""
-
-
 def wrap_response(payload: dict[str, Any]) -> dict[str, Any]:
-    """Wrap response in standard message format"""
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
@@ -194,14 +164,11 @@ def wrap_response(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ============ Symbol Resolution ============
 def strip_suffix(symbol: str) -> str:
-    """Remove exchange suffix from symbol"""
     return re.sub(r"\.(NS|NSE|BO|BSE)$", "", symbol, flags=re.IGNORECASE)
 
 
 def build_candidates(query: str) -> list[str]:
-    """Build list of candidate stock symbols to try"""
     cleaned = normalize_space(query).upper().replace(".NSE", ".NS").replace(".BSE", ".BO")
     if "." in cleaned:
         return [cleaned]
@@ -210,75 +177,7 @@ def build_candidates(query: str) -> list[str]:
     return []
 
 
-def validate_candidate(symbol: str) -> tuple[str, Any, dict[str, Any], Any] | None:
-    """Validate if a symbol is valid by fetching basic data"""
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
-        history = ticker.history(period="1y", auto_adjust=False)
-    except Exception:
-        return None
-
-    current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
-    if current_price is None and history is not None and not history.empty:
-        current_price = safe_float(history["Close"].dropna().iloc[-1])
-
-    market_cap = safe_float(info.get("marketCap"))
-    company_name = normalize_space(info.get("longName") or info.get("shortName"))
-
-    if company_name and current_price is not None and market_cap is not None:
-        return symbol, ticker, info, history
-    return None
-
-
-def _search_via_yfinance_search(query: str) -> list[str]:
-    """Search for stock symbols using yfinance Search API"""
-    if not hasattr(yf, "Search"):
-        return []
-    
-    try:
-        search = yf.Search(query, max_results=8, news_count=0, raise_errors=False)
-        quotes = getattr(search, "quotes", []) or []
-    except Exception:
-        return []
-    
-    ranked: list[str] = []
-    for quote in quotes:
-        symbol = normalize_space(quote.get("symbol") or quote.get("ticker")).upper()
-        if not symbol:
-            continue
-        if symbol.endswith(".NS"):
-            ranked.insert(0, symbol)
-        else:
-            ranked.append(symbol)
-    return ranked
-
-
-def resolve_symbol(query: str) -> tuple[str, Any, dict[str, Any], Any]:
-    """Resolve stock query to valid symbol and fetch initial data"""
-    # Try direct candidates first
-    for candidate in build_candidates(query):
-        checked = validate_candidate(candidate)
-        if checked:
-            return checked
-
-    # Try search if available
-    ranked = _search_via_yfinance_search(query)
-    seen: set[str] = set()
-    for symbol in ranked:
-        if symbol in seen:
-            continue
-        seen.add(symbol)
-        checked = validate_candidate(symbol)
-        if checked:
-            return checked
-
-    raise ValueError(f"Stock not found: {query}")
-
-
-# ============ DataFrame Helpers ============
 def ordered_columns(df: Any) -> list[Any]:
-    """Get DataFrame columns in reverse chronological order"""
     try:
         return sorted(list(df.columns), reverse=True)
     except Exception:
@@ -286,7 +185,6 @@ def ordered_columns(df: Any) -> list[Any]:
 
 
 def value_from_df(df: Any, row_names: list[str], column: Any) -> float | None:
-    """Extract value from DataFrame by searching for row names"""
     if df is None or getattr(df, "empty", True):
         return None
     row_map = {str(idx).lower(): idx for idx in df.index}
@@ -302,7 +200,6 @@ def value_from_df(df: Any, row_names: list[str], column: Any) -> float | None:
 
 
 def cagr_from_df(df: Any, row_names: list[str], points: int = 4) -> float | None:
-    """Calculate CAGR from DataFrame values"""
     if df is None or getattr(df, "empty", True):
         return None
     values: list[float] = []
@@ -321,7 +218,6 @@ def cagr_from_df(df: Any, row_names: list[str], points: int = 4) -> float | None
 
 
 def quarter_label(col: Any) -> str:
-    """Generate quarter label from column (datetime)"""
     if hasattr(col, "to_pydatetime"):
         col = col.to_pydatetime()
     if isinstance(col, datetime):
@@ -332,63 +228,9 @@ def quarter_label(col: Any) -> str:
     return "Recent Quarter"
 
 
-# ============ News Processing ============
-def _parse_news_article(article: dict) -> Optional[dict]:
-    """Parse a single news article"""
-    payload = article.get("content") if isinstance(article.get("content"), dict) else article
-    headline = normalize_space(payload.get("title") or article.get("title") or article.get("headline"))
-    
-    if not headline:
-        return None
-    
-    summary = normalize_space(payload.get("summary") or article.get("summary") or headline)
-    corpus = f"{headline} {summary}".lower()
-    
-    # Simple sentiment analysis
-    pos = sum(word in corpus for word in ("beat", "growth", "strong", "profit", "win", "upgrade"))
-    neg = sum(word in corpus for word in ("miss", "weak", "loss", "fall", "downgrade", "delay"))
-    impact = "Positive" if pos > neg else "Negative" if neg > pos else "Neutral"
-    
-    return {
-        "headline": headline,
-        "date": format_date(payload.get("pubDate") or article.get("providerPublishTime")) or "N/A",
-        "impact": impact,
-        "summary": summary or "N/A",
-    }
-
-
-def get_news_items(ticker: Any, query: str) -> list[dict[str, Any]]:
-    """Fetch and parse news items for a stock"""
-    raw_news = []
-    
-    # Try ticker.news first
-    try:
-        raw_news = ticker.news or []
-    except Exception:
-        pass
-    
-    # Try yfinance Search if no news found
-    if not raw_news and hasattr(yf, "Search"):
-        try:
-            raw_news = (yf.Search(query, max_results=0, news_count=5, raise_errors=False).news or [])
-        except Exception:
-            pass
-
-    items: list[dict[str, Any]] = []
-    for article in raw_news[:3]:
-        parsed = _parse_news_article(article)
-        if parsed:
-            items.append(parsed)
-    
-    return items
-
-
-# ============ Quarterly Results ============
 def build_quarterly_results(q_income: Any, currency: str) -> list[dict[str, Any]]:
-    """Build quarterly results from income statement"""
     if q_income is None or getattr(q_income, "empty", True):
         return []
-    
     revenue_rows = ["Total Revenue", "Operating Revenue", "Revenue"]
     profit_rows = ["Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests"]
     cols = ordered_columns(q_income)
@@ -412,16 +254,99 @@ def build_quarterly_results(q_income: Any, currency: str) -> list[dict[str, Any]
     return results
 
 
-# ============ Scoring & Verdict ============
+def get_news_items(ticker: Any, query: str) -> list[dict[str, Any]]:
+    raw_news = []
+    try:
+        raw_news = ticker.news or []
+    except Exception:
+        raw_news = []
+    if not raw_news and hasattr(yf, "Search"):
+        try:
+            raw_news = (yf.Search(query, max_results=0, news_count=5, raise_errors=False).news or [])
+        except Exception:
+            raw_news = []
+
+    items: list[dict[str, Any]] = []
+    for article in raw_news[:3]:
+        payload = article.get("content") if isinstance(article.get("content"), dict) else article
+        headline = normalize_space(payload.get("title") or article.get("title") or article.get("headline"))
+        summary = normalize_space(payload.get("summary") or article.get("summary") or headline)
+        corpus = f"{headline} {summary}".lower()
+        pos = sum(word in corpus for word in ("beat", "growth", "strong", "profit", "win", "upgrade"))
+        neg = sum(word in corpus for word in ("miss", "weak", "loss", "fall", "downgrade", "delay"))
+        impact = "Positive" if pos > neg else "Negative" if neg > pos else "Neutral"
+        if headline:
+            items.append(
+                {
+                    "headline": headline,
+                    "date": format_date(payload.get("pubDate") or article.get("providerPublishTime")) or "N/A",
+                    "impact": impact,
+                    "summary": summary or "N/A",
+                }
+            )
+    return items
+
+
+def validate_candidate(symbol: str) -> tuple[str, Any, dict[str, Any], Any] | None:
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
+        history = ticker.history(period="1y", auto_adjust=False)
+    except Exception:
+        return None
+
+    current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
+    if current_price is None and history is not None and not history.empty:
+        current_price = safe_float(history["Close"].dropna().iloc[-1])
+
+    market_cap = safe_float(info.get("marketCap"))
+    company_name = normalize_space(info.get("longName") or info.get("shortName"))
+
+    if company_name and current_price is not None and market_cap is not None:
+        return symbol, ticker, info, history
+    return None
+
+
+def resolve_symbol(query: str) -> tuple[str, Any, dict[str, Any], Any]:
+    for candidate in build_candidates(query):
+        checked = validate_candidate(candidate)
+        if checked:
+            return checked
+
+    if hasattr(yf, "Search"):
+        try:
+            search = yf.Search(query, max_results=8, news_count=0, raise_errors=False)
+            quotes = getattr(search, "quotes", []) or []
+        except Exception:
+            quotes = []
+        ranked: list[str] = []
+        for quote in quotes:
+            symbol = normalize_space(quote.get("symbol") or quote.get("ticker")).upper()
+            if not symbol:
+                continue
+            if symbol.endswith(".NS"):
+                ranked.insert(0, symbol)
+            else:
+                ranked.append(symbol)
+        seen: set[str] = set()
+        for symbol in ranked:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            checked = validate_candidate(symbol)
+            if checked:
+                return checked
+
+    raise ValueError(f"Stock not found: {query}")
+
+
 def safe_sector_pe(sector: str | None) -> float | None:
-    """Get sector PE benchmark"""
     if not sector:
         return None
     return SECTOR_PE_BENCHMARKS.get(sector.lower())
 
 
 def compute_score(roe: float | None, debt_to_equity: float | None, pe: float | None) -> float:
-    """Compute fundamental strength score"""
     parts: list[float] = []
     if roe is not None:
         parts.append(9.0 if roe >= 18 else 7.0 if roe >= 12 else 5.0 if roe >= 8 else 3.0)
@@ -433,19 +358,16 @@ def compute_score(roe: float | None, debt_to_equity: float | None, pe: float | N
 
 
 def build_verdict(current_price: float | None, target_low: float | None, target_high: float | None, score: float, sentiment: str) -> dict[str, Any]:
-    """Build investment verdict based on analysis"""
     fair_value = round((target_low + target_high) / 2, 2) if target_low is not None and target_high is not None else None
     margin = percent_change(fair_value, current_price) if fair_value is not None and current_price is not None else None
 
-    # Determine action
     if score >= 7 and margin is not None and margin >= 8:
         action = "BUY"
-    elif score <= 4 or (margin is not None and margin <= -10):
+    elif score <= 4 or margin is not None and margin <= -10:
         action = "SELL"
     else:
         action = "HOLD"
 
-    # Calculate confidence
     confidence = 75 if action != "HOLD" else 65
     if sentiment == "Positive" and action == "BUY":
         confidence += 5
@@ -467,20 +389,16 @@ def build_verdict(current_price: float | None, target_low: float | None, target_
     }
 
 
-# ============ Market Data Fetching (Refactored) ============
-def _fetch_price_history(history: Any) -> List[float]:
-    """Extract monthly price history"""
-    if history is None or history.empty:
-        return []
-    try:
+def get_stock_data(symbol: str) -> dict[str, Any]:
+    resolved_symbol, ticker, info, history = resolve_symbol(symbol)
+    currency = normalize_space(info.get("financialCurrency") or info.get("currency")) or "INR"
+    # After fetching history
+    price_history = None
+    if history is not None and not history.empty:
         monthly = history["Close"].resample("ME").last().dropna().tail(12)
-        return [round(float(v), 2) for v in monthly]
-    except Exception:
-        return []
+        price_history = [round(float(v), 2) for v in monthly]
 
 
-def _fetch_current_and_previous_price(info: dict, history: Any) -> Tuple[Optional[float], Optional[float]]:
-    """Fetch current price and previous close"""
     current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice"))
     if current_price is None and history is not None and not history.empty:
         current_price = safe_float(history["Close"].dropna().iloc[-1])
@@ -490,12 +408,12 @@ def _fetch_current_and_previous_price(info: dict, history: Any) -> Tuple[Optiona
         closes = history["Close"].dropna()
         if len(closes) >= 2:
             previous_close = safe_float(closes.iloc[-2])
-    
-    return current_price, previous_close
 
-
-def _fetch_52_week_range(info: dict, history: Any) -> Tuple[Optional[float], Optional[float]]:
-    """Fetch 52-week high and low"""
+    market_cap = safe_float(info.get("marketCap"))
+    pe = safe_float(info.get("trailingPE"))
+    roe = safe_float(info.get("returnOnEquity"))
+    roe = round_or_none(roe * 100 if roe is not None and abs(roe) <= 1 else roe)
+    debt_to_equity = round_or_none(safe_float(info.get("debtToEquity")))
     week_high = safe_float(info.get("fiftyTwoWeekHigh"))
     week_low = safe_float(info.get("fiftyTwoWeekLow"))
 
@@ -505,92 +423,39 @@ def _fetch_52_week_range(info: dict, history: Any) -> Tuple[Optional[float], Opt
             week_high = safe_float(closes.max())
         if week_low is None and not closes.empty:
             week_low = safe_float(closes.min())
-    
-    return week_high, week_low
 
+    q_income = getattr(ticker, "quarterly_income_stmt", None)
+    annual_income = getattr(ticker, "income_stmt", None)
+    news = get_news_items(ticker, symbol)
 
-def _calculate_fundamentals(info: dict, annual_income: Any) -> dict:
-    """Calculate fundamental metrics"""
-    pe = safe_float(info.get("trailingPE"))
-    roe = safe_float(info.get("returnOnEquity"))
-    roe = round_or_none(roe * 100 if roe is not None and abs(roe) <= 1 else roe)
-    debt_to_equity = round_or_none(safe_float(info.get("debtToEquity")))
-    
+    quarterly_results = build_quarterly_results(q_income, currency)
     revenue_growth_3y = cagr_from_df(annual_income, ["Total Revenue", "Operating Revenue", "Revenue"])
     profit_growth_3y = cagr_from_df(annual_income, ["Net Income", "Net Income Common Stockholders"])
-    
     operating_margin = safe_float(info.get("operatingMargins"))
     operating_margin = round_or_none(operating_margin * 100 if operating_margin is not None and abs(operating_margin) <= 1 else operating_margin)
-    
     net_margin = safe_float(info.get("profitMargins"))
     net_margin = round_or_none(net_margin * 100 if net_margin is not None and abs(net_margin) <= 1 else net_margin)
-    
-    return {
-        "pe": round_or_none(pe),
-        "roe": roe,
-        "debt_to_equity": debt_to_equity,
-        "revenue_growth_3y": revenue_growth_3y,
-        "profit_growth_3y": profit_growth_3y,
-        "operating_margin": operating_margin,
-        "net_margin": net_margin,
-    }
 
-
-def _fetch_analyst_targets(ticker: Any) -> Tuple[Optional[float], Optional[float]]:
-    """Fetch analyst price targets"""
+    analyst_targets = {}
     try:
         analyst_targets = ticker.analyst_price_targets or {}
     except Exception:
         analyst_targets = {}
-    
     target_low = round_or_none(safe_float(analyst_targets.get("low")))
     target_high = round_or_none(safe_float(analyst_targets.get("high")))
-    return target_low, target_high
 
-
-def _calculate_news_sentiment(news: List[dict]) -> str:
-    """Calculate overall news sentiment"""
     pos = sum(item["impact"] == "Positive" for item in news)
     neg = sum(item["impact"] == "Negative" for item in news)
-    return "Positive" if pos > neg else "Negative" if neg > pos else "Neutral"
+    sentiment = "Positive" if pos > neg else "Negative" if neg > pos else "Neutral"
 
-
-def get_stock_data(symbol: str) -> dict[str, Any]:
-    """Main function to fetch and process stock data - REFACTORED"""
-    # Resolve symbol and get initial data
-    resolved_symbol, ticker, info, history = resolve_symbol(symbol)
-    currency = normalize_space(info.get("financialCurrency") or info.get("currency")) or "INR"
-    
-    # Fetch price data
-    price_history = _fetch_price_history(history)
-    current_price, previous_close = _fetch_current_and_previous_price(info, history)
-    week_high, week_low = _fetch_52_week_range(info, history)
-    market_cap = safe_float(info.get("marketCap"))
-    
-    # Fetch financial statements
-    q_income = getattr(ticker, "quarterly_income_stmt", None)
-    annual_income = getattr(ticker, "income_stmt", None)
-    
-    # Calculate metrics
-    fundamentals = _calculate_fundamentals(info, annual_income)
-    quarterly_results = build_quarterly_results(q_income, currency)
-    news = get_news_items(ticker, symbol)
-    sentiment = _calculate_news_sentiment(news)
-    
-    # Get analyst targets and compute score
-    target_low, target_high = _fetch_analyst_targets(ticker)
-    score = compute_score(fundamentals["roe"], fundamentals["debt_to_equity"], fundamentals["pe"])
-    
-    # Calculate valuation metrics
+    score = compute_score(roe, debt_to_equity, pe)
     sector = normalize_space(info.get("sector")) or "N/A"
     industry_pe = safe_sector_pe(sector)
     fair_value = round((target_low + target_high) / 2, 2) if target_low is not None and target_high is not None else None
     margin_of_safety = percent_change(fair_value, current_price) if fair_value is not None and current_price is not None else None
-    
-    # Build verdict
+
     verdict = build_verdict(current_price, target_low, target_high, score, sentiment)
 
-    # Construct response
     return {
         "company": normalize_space(info.get("longName") or info.get("shortName") or strip_suffix(resolved_symbol)),
         "ticker": resolved_symbol,
@@ -603,19 +468,19 @@ def get_stock_data(symbol: str) -> dict[str, Any]:
         "dayChange": round_or_none((current_price - previous_close) if current_price is not None and previous_close is not None else None),
         "dayChangePct": percent_change(current_price, previous_close),
         "overview": normalize_space(info.get("longBusinessSummary")) or "N/A",
-        "priceHistory": price_history,
+        "priceHistory": price_history or [],
         "fundamentals": {
-            "pe": fundamentals["pe"],
+            "pe": round_or_none(pe),
             "industryPE": round_or_none(industry_pe),
             "pbRatio": round_or_none(safe_float(info.get("priceToBook"))),
             "evEbitda": round_or_none(safe_float(info.get("enterpriseToEbitda"))),
-            "roe": fundamentals["roe"],
+            "roe": roe,
             "roce": None,
-            "debtToEquity": fundamentals["debt_to_equity"],
-            "revenueGrowth3Y": fundamentals["revenue_growth_3y"],
-            "profitGrowth3Y": fundamentals["profit_growth_3y"],
-            "operatingMargin": fundamentals["operating_margin"],
-            "netMargin": fundamentals["net_margin"],
+            "debtToEquity": debt_to_equity,
+            "revenueGrowth3Y": revenue_growth_3y,
+            "profitGrowth3Y": profit_growth_3y,
+            "operatingMargin": operating_margin,
+            "netMargin": net_margin,
             "score": score,
             "summary": "Metrics are sourced directly from Yahoo Finance info and financial statements. Missing fields are returned as None or N/A.",
         },
@@ -642,10 +507,8 @@ def get_stock_data(symbol: str) -> dict[str, Any]:
     }
 
 
-# ============ API Endpoints ============
 @app.post("/analyze")
 async def analyze(request: Request):
-    """Analyze a stock symbol"""
     try:
         payload = await request.json()
     except Exception:
@@ -670,10 +533,10 @@ async def analyze(request: Request):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     return {"status": "ok"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=True)
+
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
