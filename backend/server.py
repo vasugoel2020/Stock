@@ -468,6 +468,7 @@ def get_stock_data(symbol: str) -> dict[str, Any]:
         "dayChange": round_or_none((current_price - previous_close) if current_price is not None and previous_close is not None else None),
         "dayChangePct": percent_change(current_price, previous_close),
         "overview": normalize_space(info.get("longBusinessSummary")) or "N/A",
+        "priceHistory": price_history or [],
         "fundamentals": {
             "pe": round_or_none(pe),
             "industryPE": round_or_none(industry_pe),
